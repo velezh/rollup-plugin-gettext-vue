@@ -145,8 +145,9 @@ function resolveNGettext(node, message, item){
     if ( !argumentsArray.length )
         return node.getText();
 
+    let isSingleQuote = node.arguments[0] && node.arguments[0].getText().charCodeAt(0) === 39;
     argumentsArray = argumentsArray.map(function(el){
-        return ts.getLiteralText(ts.createStringLiteral(el), '', true, false);
+        return ts.getLiteralText(ts.createLiteral(el, isSingleQuote), '', true, false);
     });
 
     if ( config.calleeNames.npgettext.indexOf(callName) >= 0 ) {
