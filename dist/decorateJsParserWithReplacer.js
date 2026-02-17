@@ -4,6 +4,12 @@ const parser_1 = require("gettext-extractor/dist/parser");
 const ts = require("typescript");
 const config = require('./config.js');
 
+// vue-template-compiler for proper .vue template parsing
+// (TS parser cannot reliably parse HTML — it may enter JSX mode or produce
+// broken ASTs, causing translation calls in <template> to be missed)
+let vueCompiler;
+try { vueCompiler = require('vue-template-compiler'); } catch(e) {}
+
 module.exports = function (jsParser) {
 
     jsParser.parseSourceFile = function(source, fileName, options = {}) {
@@ -18,7 +24,12 @@ module.exports = function (jsParser) {
             source = options.transformSource(source);
         }
 
-        let messages = jsParser.parseSource(source, fileName || Parser.STRING_LITERAL_FILENAME, options);
+        let messages;
+        if (vueCompiler && fileName && fileName.endsWith('.vue')) {
+            messages = jsParser.parseVueSource(source, fileName, options);
+        } else {
+            messages = jsParser.parseSource(source, fileName || Parser.STRING_LITERAL_FILENAME, options);
+        }
         for (let message of messages) {
             this.builder.addMessage(message);
         }
@@ -34,6 +45,68 @@ module.exports = function (jsParser) {
     jsParser.parseSource = function(source, fileName, options = {}) {
         let sourceFile = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, options.scriptKind);
         return jsParser.parseNodeSource(sourceFile, sourceFile, options.lineNumberStart || 1);
+    };
+
+    jsParser.parseVueSource = function(source, fileName, options) {
+        var parsed = vueCompiler.parseComponent(source);
+        var messages = [];
+
+        // 1. Parse <script> with TS — it's valid JS, so TS handles it correctly
+        if (parsed.script && parsed.script.content) {
+            var newlinesBefore = (source.substring(0, parsed.script.start).match(/\n/g) || []).length;
+            var scriptMessages = jsParser.parseSource(parsed.script.content, fileName, {
+                lineNumberStart: newlinesBefore + 1,
+                scriptKind: options.scriptKind
+            });
+            messages = messages.concat(scriptMessages);
+        }
+
+        // 2. Parse <template> expressions via vue-template-compiler AST
+        //    (each expression is valid JS, so TS parser handles it correctly)
+        if (parsed.template && parsed.template.content) {
+            var compiled = vueCompiler.compile(parsed.template.content);
+            if (compiled.ast) {
+                var expressions = [];
+
+                function walkAst(node) {
+                    if (!node) return;
+                    // type 2 = interpolation {{ }}
+                    if (node.type === 2 && node.expression) {
+                        expressions.push(node.expression);
+                    }
+                    // dynamic attributes (:attr) and directives (v-*)
+                    if (node.attrsMap) {
+                        Object.keys(node.attrsMap).forEach(function(attr) {
+                            if (attr.charAt(0) === ':' || attr.indexOf('v-') === 0) {
+                                expressions.push(node.attrsMap[attr]);
+                            }
+                        });
+                    }
+                    if (node.children) {
+                        node.children.forEach(function(child) { walkAst(child); });
+                    }
+                    if (node.ifConditions) {
+                        node.ifConditions.forEach(function(cond) {
+                            if (cond.block && cond.block !== node) walkAst(cond.block);
+                        });
+                    }
+                    if (node.scopedSlots) {
+                        Object.values(node.scopedSlots).forEach(function(slot) { walkAst(slot); });
+                    }
+                }
+
+                walkAst(compiled.ast);
+
+                expressions.forEach(function(expr) {
+                    try {
+                        var exprMessages = jsParser.parseSource(expr, fileName);
+                        messages = messages.concat(exprMessages);
+                    } catch(e) { /* ignore parse errors */ }
+                });
+            }
+        }
+
+        return messages;
     };
 
     jsParser.parseNodeSource = function(node, sourceFile, lineNumberStart){
